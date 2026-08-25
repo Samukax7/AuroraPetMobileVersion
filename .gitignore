@@ -1,0 +1,8 @@
+.godot/
+android/build/
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+*~
