@@ -1,0 +1,717 @@
+extends Node
+class_name PetStats
+
+const ACTION_XP: Dictionary = {
+	&"fruta_estelar": 8,
+	&"nectar_cosmico": 8,
+	&"banquete_nebulosa": 8,
+	&"dar_remedio": 8,
+	&"limpar_sujeira": 8,
+	&"dormir": 8,
+	&"jokenpo": 15,
+	&"jogo_da_velha": 20,
+	&"2048": 20,
+	&"treinar": 25,
+	&"batalhar": 0,
+}
+
+## Sistema de necessidades do AuroraPet inspirado em V-Pets clássicos.
+## O ritmo é relaxado: o pet sinaliza necessidades críticas e registra histórico,
+## mas não possui morte permanente nesta etapa.
+
+signal stats_changed(hunger: float, energy: float, mood: float, health: float)
+signal needs_changed(snapshot: Dictionary)
+signal action_performed(action: StringName)
+signal critical_state_changed(is_critical: bool)
+signal attention_changed(active: bool, reason: StringName)
+signal illness_changed(is_sick: bool)
+signal sleep_state_changed(is_sleeping: bool)
+signal newborn_tutorial_step_changed(step: StringName, message: String)
+signal newborn_tutorial_completed
+signal reaction_requested(action: StringName, reaction_id: StringName)
+signal action_blocked(action: StringName, message: String)
+signal action_refused(action: StringName, system_message: String, pet_message: String)
+signal action_info(action: StringName, system_message: String, pet_message: String)
+signal behavior_event(event_id: StringName, system_message: String, pet_message: String)
+signal poop_state_changed(visible: bool)
+signal special_need_changed(need: StringName, wish: StringName, active: bool)
+
+const NEWBORN_TUTORIAL_FEED_TARGET := 100.0
+const SPECIAL_NEED_INTERVAL_SECONDS := 45.0
+const FOOD_REFUSAL_HUNGER_THRESHOLD := 95.0
+const TRAIN_MIN_ENERGY := 20.0
+const TRAIN_MIN_HUNGER := 20.0
+const MINIGAME_MIN_ENERGY := 15.0
+const BATTLE_MIN_HEALTH := 25.0
+const BATTLE_MIN_ENERGY := 15.0
+const SLEEP_REFUSAL_ENERGY := 95.0
+const MEDICINE_REFUSAL_HEALTH := 95.0
+const BEHAVIOR_EVENT_INTERVAL_SECONDS := 90.0
+const TRAIN_REFUSAL_CHANCE := 0.60
+const PLAY_REFUSAL_CHANCE := 0.40
+
+var newborn_tutorial_active := false
+var newborn_tutorial_step: StringName = &"inactive"
+var newborn_tutorial_fed := false
+var current_reaction: StringName = &"idle"
+var special_need: StringName = &""
+var special_need_wish: StringName = &""
+var poop_visible := false
+var _special_need_elapsed := 0.0
+var _meals_since_poop := 0
+
+@export_category("Valores iniciais")
+@export_range(0.0, 100.0, 1.0) var hunger := 82.0
+@export_range(0.0, 100.0, 1.0) var energy := 76.0
+@export_range(0.0, 100.0, 1.0) var mood := 68.0
+@export_range(0.0, 100.0, 1.0) var health := 91.0
+@export_range(0.0, 100.0, 1.0) var hygiene := 86.0
+@export_range(0.0, 100.0, 1.0) var discipline := 62.0
+@export_range(0.0, 100.0, 1.0) var obedience := 72.0
+@export_range(0.0, 100.0, 1.0) var audacity := 28.0
+@export_range(0.0, 100.0, 0.1) var weight := 18.0
+
+@export_category("Decaimento tranquilo por segundo")
+@export var decay_enabled := true
+@export_range(0.0, 1.0, 0.001) var hunger_decay := 0.025
+@export_range(0.0, 1.0, 0.001) var energy_decay := 0.018
+@export_range(0.0, 1.0, 0.001) var mood_decay := 0.012
+@export_range(0.0, 1.0, 0.001) var hygiene_decay := 0.020
+@export_range(0.0, 1.0, 0.001) var discipline_decay := 0.004
+@export_range(0.0, 5.0, 0.05) var decay_multiplier := 1.0
+@export_range(0.25, 5.0, 0.25) var decay_tick_interval := 1.0
+
+@export_category("Proteção da saúde")
+@export_range(0.0, 100.0, 1.0) var critical_hunger_threshold := 15.0
+@export_range(0.0, 100.0, 1.0) var critical_energy_threshold := 15.0
+@export_range(0.0, 100.0, 1.0) var critical_mood_threshold := 15.0
+@export_range(0.0, 100.0, 1.0) var critical_hygiene_threshold := 18.0
+@export_range(0.0, 1.0, 0.001) var critical_health_decay := 0.02
+@export var health_falls_only_when_critical := true
+
+@export_category("Chamadas e erros de cuidado")
+@export_range(1.0, 3600.0, 1.0) var attention_response_window_seconds := 900.0
+@export_range(1.0, 300.0, 1.0) var hygiene_illness_delay_seconds := 120.0
+@export_range(0.0, 1.0, 0.001) var illness_health_decay := 0.05
+@export_range(0.0, 20.0, 0.5) var discipline_loss_per_care_mistake := 4.0
+@export_range(0.0, 20.0, 0.5) var discipline_gain_per_training := 4.0
+@export_range(0.0, 20.0, 0.5) var obedience_gain_per_training := 3.0
+@export_range(0.0, 20.0, 0.5) var audacity_gain_per_play := 2.0
+@export_range(0.0, 20.0, 0.5) var obedience_loss_per_care_mistake := 4.0
+@export_range(0.0, 20.0, 0.5) var audacity_gain_per_care_mistake := 3.0
+
+@export_category("Sono")
+@export_range(0.0, 20.0, 0.1) var sleep_energy_recovery_per_second := 6.0
+@export_range(0.0, 5.0, 0.1) var sleep_mood_recovery_per_second := 0.25
+@export var sleep_requires_full_energy := true
+
+@export_category("Resistência")
+@export var use_skill_resistance := true
+@export_range(0.0, 100.0, 1.0) var resistance := 0.0
+@export_range(0.0, 1.0, 0.01) var resistance_decay_reduction := 0.50
+
+@export_category("Histórico de cuidado")
+@export_range(0, 999999, 1) var missed_calls := 0
+@export_range(0, 999999, 1) var care_mistakes := 0
+@export_range(0, 999999, 1) var discipline_mistakes := 0
+@export_range(0, 999999, 1) var excessive_meals := 0
+@export_range(0, 999999, 1) var meals_served := 0
+@export_range(0, 999999, 1) var games_played := 0
+
+var is_sick := false
+var is_sleeping := false
+var attention_reason: StringName = &""
+var _decay_accumulator := 0.0
+var _hygiene_critical_elapsed := 0.0
+var _attention_elapsed := 0.0
+var _last_critical_state := false
+var _behavior_event_elapsed := 0.0
+var _behavior_rng := RandomNumberGenerator.new()
+var _pet_skills: PetSkills
+
+func _ready() -> void:
+	_behavior_rng.randomize()
+	_pet_skills = get_parent().get_node_or_null(^"PetSkills") as PetSkills
+	_clamp_values()
+	_last_critical_state = _is_needs_critical()
+	_emit_all_state()
+
+## Estado técnico do modo DEV: jogável imediatamente e sem alterar a estrutura do pet.
+func prepare_development_state() -> void:
+	newborn_tutorial_active = false
+	newborn_tutorial_step = &"inactive"
+	newborn_tutorial_fed = false
+	current_reaction = &"idle"
+	special_need = &""
+	special_need_wish = &""
+	poop_visible = false
+	hunger = 80.0
+	energy = 100.0
+	mood = 100.0
+	health = 100.0
+	hygiene = 100.0
+	discipline = 100.0
+	obedience = 100.0
+	audacity = 0.0
+	weight = 18.0
+	is_sick = false
+	is_sleeping = false
+	attention_reason = &""
+	missed_calls = 0
+	care_mistakes = 0
+	discipline_mistakes = 0
+	excessive_meals = 0
+	meals_served = 0
+	games_played = 0
+	_clamp_values()
+	_emit_all_state()
+	sleep_state_changed.emit(false)
+	illness_changed.emit(false)
+	attention_changed.emit(false, &"")
+	poop_state_changed.emit(false)
+
+func begin_newborn_tutorial() -> void:
+	newborn_tutorial_active = true
+	newborn_tutorial_step = &"feed"
+	newborn_tutorial_fed = false
+	hunger = 20.0
+	energy = 30.0
+	_clamp_values()
+	_emit_all_state()
+	newborn_tutorial_step_changed.emit(newborn_tutorial_step, get_newborn_tutorial_message())
+
+func is_newborn_tutorial_active() -> bool:
+	return newborn_tutorial_active
+
+func get_newborn_tutorial_message() -> String:
+	match newborn_tutorial_step:
+		&"feed":
+			return "A fome está baixa. Escolha uma comida."
+		&"sleep":
+			return "A energia caiu. Deixe o pet dormir."
+		&"complete":
+			return "Novo jogo disponível: Jogo da Velha"
+	return ""
+
+func _set_newborn_tutorial_step(step: StringName) -> void:
+	newborn_tutorial_step = step
+	newborn_tutorial_step_changed.emit(step, get_newborn_tutorial_message())
+
+func _process(delta: float) -> void:
+	if delta <= 0.0:
+		return
+	if is_sleeping:
+		_process_sleep(delta)
+	elif decay_enabled:
+		_decay_accumulator += delta
+		if _decay_accumulator >= decay_tick_interval:
+			var elapsed := _decay_accumulator
+			_decay_accumulator = 0.0
+			_apply_decay(elapsed)
+	_update_attention(delta)
+	_update_illness(delta)
+	if not is_sleeping:
+		_update_special_need(delta)
+		_update_behavior_event(delta)
+
+func _process_sleep(delta: float) -> void:
+	energy += sleep_energy_recovery_per_second * delta
+	mood += sleep_mood_recovery_per_second * delta
+	_clamp_values()
+	if sleep_requires_full_energy and energy >= 100.0:
+		energy = 100.0
+		is_sleeping = false
+		sleep_state_changed.emit(false)
+		if newborn_tutorial_active and newborn_tutorial_step == &"sleep":
+			call_deferred("_complete_newborn_tutorial")
+	_emit_all_state()
+
+func _update_behavior_event(delta: float) -> void:
+	if newborn_tutorial_active or not special_need.is_empty() or poop_visible:
+		return
+	_behavior_event_elapsed += delta
+	if _behavior_event_elapsed < BEHAVIOR_EVENT_INTERVAL_SECONDS:
+		return
+	_behavior_event_elapsed = 0.0
+	var roll := _behavior_rng.randf()
+	if audacity >= 65.0 and obedience < 40.0 and roll < 0.30:
+		_apply_behavior_event(&"bagunca", "EVENTO COMPORTAMENTAL: BAGUNÇA", "Hehe... talvez eu tenha exagerado um pouquinho.")
+		return
+	if audacity >= 65.0 and obedience < 40.0 and roll < 0.60:
+		_apply_behavior_event(&"desafio", "EVENTO COMPORTAMENTAL: DESAFIO", "Não quero obedecer agora. O espaço é meu!")
+		return
+	if obedience >= 75.0 and audacity <= 35.0 and roll < 0.35:
+		_apply_behavior_event(&"afeto", "EVENTO POSITIVO: VÍNCULO CÓSMICO", "Gosto de ficar perto de você.")
+		return
+	if obedience >= 75.0 and audacity <= 35.0 and roll < 0.70:
+		_apply_behavior_event(&"meditacao", "EVENTO POSITIVO: MEDITAÇÃO", "Respirei fundo e encontrei equilíbrio nas estrelas.")
+
+func _apply_behavior_event(event_id: StringName, system_message: String, pet_message: String) -> void:
+	match event_id:
+		&"bagunca":
+			hygiene -= 12.0
+			mood += 4.0
+			audacity += 5.0
+			obedience -= 3.0
+			_set_poop_visible(true)
+		&"desafio":
+			mood -= 3.0
+			audacity += 4.0
+			obedience -= 5.0
+		&"afeto":
+			mood += 7.0
+			health += 1.0
+			obedience += 1.0
+		&"meditacao":
+			mood += 4.0
+			energy += 4.0
+			audacity -= 2.0
+	_clamp_values()
+	behavior_event.emit(event_id, system_message, pet_message)
+	_emit_all_state()
+
+func _update_special_need(delta: float) -> void:
+	if not special_need.is_empty() or poop_visible:
+		return
+	_special_need_elapsed += delta
+	if _special_need_elapsed < SPECIAL_NEED_INTERVAL_SECONDS:
+		return
+	_special_need_elapsed = 0.0
+	var wishes: Array[Dictionary] = []
+	if _pet_skills == null or _pet_skills.is_action_unlocked(&"jogo_da_velha"):
+		wishes.append({"need": &"brincar", "wish": &"jogo_da_velha"})
+	if _pet_skills == null or _pet_skills.is_category_unlocked(&"treinar"):
+		wishes.append({"need": &"treinar", "wish": &"forca"})
+	if wishes.is_empty():
+		return
+	var selected: Dictionary = wishes[randi_range(0, wishes.size() - 1)]
+	special_need = selected["need"]
+	special_need_wish = selected["wish"]
+	special_need_changed.emit(special_need, special_need_wish, true)
+
+func _apply_decay(elapsed: float) -> void:
+	var effective_multiplier := decay_multiplier * _get_resistance_factor()
+	hunger -= hunger_decay * effective_multiplier * elapsed
+	energy -= energy_decay * effective_multiplier * elapsed
+	mood -= mood_decay * effective_multiplier * elapsed
+	hygiene -= hygiene_decay * effective_multiplier * elapsed
+	discipline -= discipline_decay * effective_multiplier * elapsed
+
+	if hygiene <= critical_hygiene_threshold:
+		_hygiene_critical_elapsed += elapsed
+	else:
+		_hygiene_critical_elapsed = 0.0
+
+	var critical_count := _get_critical_count()
+	if health_falls_only_when_critical and critical_count > 0:
+		health -= critical_health_decay * effective_multiplier * critical_count * elapsed
+	elif not health_falls_only_when_critical:
+		health -= critical_health_decay * effective_multiplier * elapsed
+	if is_sick:
+		health -= illness_health_decay * effective_multiplier * elapsed
+
+	_clamp_values()
+	_emit_critical_state_if_changed()
+	_emit_all_state()
+
+func _update_illness(_delta: float) -> void:
+	if not is_sick and _hygiene_critical_elapsed >= hygiene_illness_delay_seconds:
+		_set_illness(true)
+
+func _update_attention(delta: float) -> void:
+	var next_reason := _evaluate_attention_reason()
+	if next_reason != attention_reason:
+		attention_reason = next_reason
+		_attention_elapsed = 0.0
+		attention_changed.emit(not attention_reason.is_empty(), attention_reason)
+		_emit_needs_state()
+		return
+	if attention_reason.is_empty():
+		return
+	_attention_elapsed += delta
+	if _attention_elapsed >= attention_response_window_seconds:
+		_register_care_mistake()
+		_attention_elapsed = 0.0
+		attention_reason = &""
+		attention_changed.emit(false, &"")
+		_emit_needs_state()
+
+func _evaluate_attention_reason() -> StringName:
+	if is_sleeping:
+		return &""
+	if is_sick:
+		return &"doenca"
+	if hunger <= critical_hunger_threshold:
+		return &"fome"
+	if energy <= critical_energy_threshold:
+		return &"sono"
+	if mood <= critical_mood_threshold:
+		return &"humor"
+	if hygiene <= critical_hygiene_threshold:
+		return &"higiene"
+	return &""
+
+func _register_care_mistake() -> void:
+	missed_calls += 1
+	care_mistakes += 1
+	discipline_mistakes += 1
+	discipline -= discipline_loss_per_care_mistake
+	obedience -= obedience_loss_per_care_mistake
+	audacity += audacity_gain_per_care_mistake
+	_clamp_values()
+
+func get_action_check(action: StringName) -> Dictionary:
+	var accepted := {
+		"allowed": true,
+		"kind": &"accepted",
+		"reason": &"",
+		"system_message": "",
+		"pet_message": "",
+	}
+	if action.is_empty():
+		return _action_refusal(&"acao_invalida", "AÇÃO INDISPONÍVEL", "Não encontrei essa ação.")
+	if is_sleeping:
+		if action == &"dormir":
+			return _action_info(&"sono_ativo", "PET JÁ ESTÁ DORMINDO", "Zzz... ainda estou recuperando minha energia.")
+		return _action_refusal(&"sono", "PET DORMINDO: ENERGIA %d%% / 100%%" % roundi(energy), "Estou dormindo. Deixe minha energia chegar a 100%%.")
+	if action in [&"comer", &"fruta_estelar", &"nectar_cosmico", &"banquete_nebulosa"] and hunger >= FOOD_REFUSAL_HUNGER_THRESHOLD:
+		return _action_refusal(&"satisfeito", "ALIMENTAÇÃO RECUSADA: FOME JÁ ESTÁ EM %d%%" % roundi(hunger), "Estou satisfeito. Não consigo comer mais agora.")
+	if action == &"dar_remedio" and not is_sick and health >= MEDICINE_REFUSAL_HEALTH:
+		return _action_refusal(&"sem_doenca", "REMÉDIO DESNECESSÁRIO: SAÚDE EM %d%%" % roundi(health), "Não preciso de remédio; estou me sentindo ótimo.")
+	if action == &"limpar_sujeira" or action == &"limpar":
+		if not poop_visible and hygiene >= 95.0:
+			return _action_info(&"ambiente_limpo", "NADA PARA LIMPAR: HIGIENE EM %d%%" % roundi(hygiene), "Está tudo limpinho por aqui.")
+	if action == &"treinar":
+		if is_sick:
+			return _action_refusal(&"doenca_treino", "TREINO RECUSADO: PET DOENTE", "Não consigo treinar doente. Preciso de cuidados primeiro.")
+		if energy < TRAIN_MIN_ENERGY:
+			return _action_refusal(&"energia_treino", "TREINO RECUSADO: ENERGIA ABAIXO DE %d%%" % roundi(TRAIN_MIN_ENERGY), "Estou cansado demais para treinar. Preciso dormir.")
+		if hunger < TRAIN_MIN_HUNGER:
+			return _action_refusal(&"fome_treino", "TREINO RECUSADO: FOME ABAIXO DE %d%%" % roundi(TRAIN_MIN_HUNGER), "Estou com fome. Vamos comer antes do treino.")
+		if obedience < 35.0 and _behavior_rng.randf() < TRAIN_REFUSAL_CHANCE:
+			return _action_refusal(&"obediencia_treino", "TREINO RECUSADO: OBEDIÊNCIA BAIXA", "Não quero treinar agora. Tente criar confiança comigo.")
+	if action in [&"jokenpo", &"jogo_da_velha", &"2048"] and energy < MINIGAME_MIN_ENERGY:
+		return _action_refusal(&"energia_jogo", "JOGO RECUSADO: ENERGIA ABAIXO DE %d%%" % roundi(MINIGAME_MIN_ENERGY), "Estou cansado demais para brincar agora.")
+	if action in [&"jokenpo", &"jogo_da_velha", &"2048"] and audacity > 65.0 and obedience < 40.0 and _behavior_rng.randf() < PLAY_REFUSAL_CHANCE:
+		return _action_refusal(&"rebeldia_jogo", "JOGO RECUSADO: PET EM ESTADO REBELDE", "Hoje eu não quero seguir regras. Talvez depois eu brinque.")
+	if action in [&"batalhar", &"batalha_exploracao"]:
+		if health < BATTLE_MIN_HEALTH:
+			return _action_refusal(&"saude_batalha", "BATALHA RECUSADA: SAÚDE ABAIXO DE %d%%" % roundi(BATTLE_MIN_HEALTH), "Minha saúde está baixa demais para explorar.")
+		if energy < BATTLE_MIN_ENERGY:
+			return _action_refusal(&"energia_batalha", "BATALHA RECUSADA: ENERGIA ABAIXO DE %d%%" % roundi(BATTLE_MIN_ENERGY), "Preciso dormir antes de enfrentar um Eco.")
+	if action == &"dormir" and energy >= SLEEP_REFUSAL_ENERGY:
+		return _action_refusal(&"energia_cheia", "SONO RECUSADO: ENERGIA JÁ ESTÁ EM %d%%" % roundi(energy), "Estou superelétrico; ainda não preciso dormir.")
+	return accepted
+
+func _action_refusal(reason: StringName, system_message: String, pet_message: String) -> Dictionary:
+	return {
+		"allowed": false,
+		"kind": &"refused",
+		"reason": reason,
+		"system_message": system_message,
+		"pet_message": pet_message,
+	}
+
+func _action_info(reason: StringName, system_message: String, pet_message: String) -> Dictionary:
+	return {
+		"allowed": false,
+		"kind": &"info",
+		"reason": reason,
+		"system_message": system_message,
+		"pet_message": pet_message,
+	}
+
+func get_action_xp(action: StringName) -> int:
+	return int(ACTION_XP.get(action, 0))
+
+func get_action_feedback(action: StringName) -> String:
+	match action:
+		&"fruta_estelar": return "FRUTA ESTELAR: +18 FOME / +2 HUMOR"
+		&"nectar_cosmico": return "NÉCTAR CÓSMICO: +28 FOME / +4 ENERGIA"
+		&"banquete_nebulosa": return "BANQUETE NEBULOSA: +42 FOME / +6 HUMOR"
+		&"dar_remedio": return "REMÉDIO APLICADO: +SAÚDE"
+		&"limpar_sujeira": return "SUJEIRA LIMPA: +35 HIGIENE"
+		&"dormir": return "SONO INICIADO: FUNÇÕES PAUSADAS ATÉ ENERGIA 100%"
+		&"jokenpo": return "JOKENPÔ: +18 HUMOR / +15 XP"
+		&"jogo_da_velha": return "JOGO DA VELHA: +20 HUMOR / +20 XP"
+		&"2048": return "2048: +22 HUMOR / +20 XP"
+		&"treinar": return "TREINO: +4 DISCIPLINA / +25 XP"
+		&"batalhar": return "BATALHA: -12 ENERGIA / +12 HUMOR"
+	return "AÇÃO: " + String(action).to_upper()
+
+func report_action_check(action: StringName) -> bool:
+	var action_check: Dictionary = get_action_check(action)
+	if bool(action_check.get("allowed", false)):
+		return true
+	var kind: StringName = StringName(String(action_check.get("kind", &"refused")))
+	if kind == &"info":
+		action_info.emit(action, String(action_check.get("system_message", "")), String(action_check.get("pet_message", "")))
+	else:
+		action_refused.emit(action, String(action_check.get("system_message", "AÇÃO RECUSADA")), String(action_check.get("pet_message", "")))
+	return false
+
+func perform_action(action: StringName) -> bool:
+	if not report_action_check(action):
+		return false
+	match action:
+		&"comer":
+			_apply_food(18.0, 0.0, 1.0, 1.0)
+		&"fruta_estelar":
+			_apply_food(18.0, 2.0, 1.0, 1.0)
+		&"nectar_cosmico":
+			_apply_food(28.0, 4.0, 2.0, 2.0)
+		&"banquete_nebulosa":
+			_apply_food(42.0, 6.0, 3.0, 4.0)
+		&"brincar", &"jokenpo":
+			_apply_game(18.0, 10.0, 6.0)
+		&"jogo_da_velha":
+			_apply_game(20.0, 8.0, 5.0)
+		&"2048":
+			_apply_game(22.0, 12.0, 4.0)
+		&"limpar", &"limpar_sujeira":
+			_set_poop_visible(false)
+			hygiene += 35.0
+			health += 14.0
+			mood += 8.0
+			energy -= 3.0
+			_hygiene_critical_elapsed = 0.0
+		&"dar_remedio":
+			if is_sick:
+				_set_illness(false)
+				health += 24.0
+			else:
+				health += 2.0
+			mood -= 1.0
+			energy -= 2.0
+		&"treinar":
+			mood += 10.0
+			energy -= 18.0
+			hunger -= 10.0
+			health += 3.0
+			discipline += discipline_gain_per_training
+			obedience += obedience_gain_per_training
+			audacity -= 1.0
+		&"batalhar":
+			mood += 12.0
+			energy -= 12.0
+			hunger -= 6.0
+			health += 1.0
+		&"dormir":
+			_start_sleep()
+			mood += 5.0
+			hunger -= 7.0
+			health += 2.0
+		_:
+			push_warning("Ação desconhecida: %s" % action)
+			return false
+	if action in [&"jokenpo", &"jogo_da_velha", &"2048", &"brincar"]:
+		audacity += audacity_gain_per_play
+		obedience -= 0.5
+	if action in [&"fruta_estelar", &"nectar_cosmico", &"banquete_nebulosa", &"dar_remedio", &"limpar_sujeira", &"limpar", &"dormir"]:
+		obedience += 0.5
+	_clamp_values()
+	_refresh_attention_after_action()
+	_clear_special_need_if_completed(action)
+	_emit_critical_state_if_changed()
+	_emit_all_state()
+	_advance_newborn_tutorial(action)
+	_emit_reaction(action)
+	action_performed.emit(action)
+	return true
+
+func _advance_newborn_tutorial(action: StringName) -> void:
+	if not newborn_tutorial_active:
+		return
+	var is_food_action := action in [&"comer", &"fruta_estelar", &"nectar_cosmico", &"banquete_nebulosa"]
+	if newborn_tutorial_step == &"feed" and is_food_action and hunger >= NEWBORN_TUTORIAL_FEED_TARGET:
+		newborn_tutorial_fed = true
+		_set_newborn_tutorial_step(&"sleep")
+
+func _complete_newborn_tutorial() -> void:
+	if not newborn_tutorial_active or newborn_tutorial_step != &"sleep" or not newborn_tutorial_fed:
+		return
+	newborn_tutorial_active = false
+	_set_newborn_tutorial_step(&"complete")
+	newborn_tutorial_completed.emit()
+
+func _emit_reaction(action: StringName) -> void:
+	var reaction_id: StringName = action
+	if action == &"limpar":
+		reaction_id = &"limpar_sujeira"
+	elif action == &"dar_remedio":
+		reaction_id = &"dar_remedio"
+	elif action == &"treinar":
+		reaction_id = &"treinar"
+	elif action == &"dormir":
+		reaction_id = &"dormir"
+	current_reaction = reaction_id
+	reaction_requested.emit(action, reaction_id)
+
+func _clear_special_need_if_completed(action: StringName) -> void:
+	if special_need == &"brincar" and action in [&"jokenpo", &"jogo_da_velha", &"2048", &"brincar"]:
+		special_need = &""
+		special_need_wish = &""
+		special_need_changed.emit(&"", &"", false)
+	elif special_need == &"treinar" and action == &"treinar":
+		special_need = &""
+		special_need_wish = &""
+		special_need_changed.emit(&"", &"", false)
+
+func _set_poop_visible(value: bool) -> void:
+	if poop_visible == value:
+		return
+	poop_visible = value
+	poop_state_changed.emit(poop_visible)
+
+func _apply_food(hunger_gain: float, mood_gain: float, health_gain: float, weight_gain: float) -> void:
+	if hunger >= 94.0:
+		excessive_meals += 1
+		mood -= 2.0
+	else:
+		meals_served += 1
+		_meals_since_poop += 1
+		if _meals_since_poop >= 3:
+			_meals_since_poop = 0
+			_set_poop_visible(true)
+		hunger += hunger_gain
+		mood += mood_gain
+		health += health_gain
+		weight += weight_gain
+
+func _apply_game(mood_gain: float, energy_cost: float, hunger_cost: float) -> void:
+	games_played += 1
+	mood += mood_gain
+	energy -= energy_cost
+	hunger -= hunger_cost
+	weight = maxf(0.0, weight - 1.0)
+
+func _start_sleep() -> void:
+	is_sleeping = true
+	attention_reason = &""
+	_attention_elapsed = 0.0
+	sleep_state_changed.emit(true)
+	attention_changed.emit(false, &"")
+
+func _refresh_attention_after_action() -> void:
+	var next_reason := _evaluate_attention_reason()
+	if next_reason != attention_reason:
+		attention_reason = next_reason
+		_attention_elapsed = 0.0
+		attention_changed.emit(not attention_reason.is_empty(), attention_reason)
+
+func cure_illness() -> void:
+	if is_sick:
+		_set_illness(false)
+		health += 24.0
+		_clamp_values()
+		_emit_all_state()
+
+func set_stat(stat: StringName, value: float) -> void:
+	match stat:
+		&"fome": hunger = value
+		&"energia": energy = value
+		&"humor": mood = value
+		&"saude": health = value
+		&"higiene": hygiene = value
+		&"disciplina": discipline = value
+		&"obediencia": obedience = value
+		&"ousadia": audacity = value
+		_:
+			push_warning("Status desconhecido: %s" % stat)
+			return
+	_clamp_values()
+	_emit_critical_state_if_changed()
+	_emit_all_state()
+
+func is_needs_critical() -> bool:
+	return _is_needs_critical()
+
+func get_needs_snapshot() -> Dictionary:
+	return {
+		"hunger": hunger,
+		"energy": energy,
+		"mood": mood,
+		"health": health,
+		"hygiene": hygiene,
+		"discipline": discipline,
+		"obedience": obedience,
+		"audacity": audacity,
+		"weight": weight,
+		"is_sick": is_sick,
+		"is_sleeping": is_sleeping,
+		"poop_visible": poop_visible,
+		"special_need": special_need,
+		"special_need_wish": special_need_wish,
+		"attention_active": not attention_reason.is_empty(),
+		"attention_reason": attention_reason,
+		"missed_calls": missed_calls,
+		"care_mistakes": care_mistakes,
+		"discipline_mistakes": discipline_mistakes,
+		"excessive_meals": excessive_meals,
+	}
+
+func get_attention_message() -> String:
+	match attention_reason:
+		&"fome": return "O PET ESTÁ COM FOME"
+		&"sono": return "O PET ESTÁ COM SONO"
+		&"humor": return "O PET QUER BRINCAR"
+		&"higiene": return "O PET PRECISA DE CUIDADOS"
+		&"doenca": return "O PET PRECISA DE REMÉDIO"
+	return ""
+
+func get_resistance_value() -> float:
+	if use_skill_resistance:
+		var pet_skills := get_parent().get_node_or_null(^"PetSkills") as PetSkills
+		if pet_skills != null:
+			return clampf(float(pet_skills.resistance), 0.0, 100.0)
+	return resistance
+
+func _get_resistance_factor() -> float:
+	var reduction := clampf(get_resistance_value() / 100.0 * resistance_decay_reduction, 0.0, 0.75)
+	return 1.0 - reduction
+
+func _get_critical_count() -> int:
+	var count := 0
+	if hunger <= critical_hunger_threshold:
+		count += 1
+	if energy <= critical_energy_threshold:
+		count += 1
+	if mood <= critical_mood_threshold:
+		count += 1
+	if hygiene <= critical_hygiene_threshold:
+		count += 1
+	return count
+
+func _is_needs_critical() -> bool:
+	return _get_critical_count() > 0 or is_sick
+
+func _emit_critical_state_if_changed() -> void:
+	var current_critical_state := _is_needs_critical()
+	if current_critical_state != _last_critical_state:
+		_last_critical_state = current_critical_state
+		critical_state_changed.emit(current_critical_state)
+
+func _set_illness(value: bool) -> void:
+	if is_sick == value:
+		return
+	is_sick = value
+	illness_changed.emit(is_sick)
+	_emit_critical_state_if_changed()
+
+func _clamp_values() -> void:
+	hunger = clampf(hunger, 0.0, 100.0)
+	energy = clampf(energy, 0.0, 100.0)
+	mood = clampf(mood, 0.0, 100.0)
+	health = clampf(health, 0.0, 100.0)
+	hygiene = clampf(hygiene, 0.0, 100.0)
+	discipline = clampf(discipline, 0.0, 100.0)
+	obedience = clampf(obedience, 0.0, 100.0)
+	audacity = clampf(audacity, 0.0, 100.0)
+	weight = clampf(weight, 0.0, 100.0)
+
+func _emit_all_state() -> void:
+	stats_changed.emit(hunger, energy, mood, health)
+	_emit_needs_state()
+
+func _emit_needs_state() -> void:
+	needs_changed.emit(get_needs_snapshot())
